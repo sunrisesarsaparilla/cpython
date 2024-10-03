@@ -459,6 +459,25 @@ class ZipInfo (object):
         result.append('>')
         return ''.join(result)
 
+    def __eq__(self, other):
+        return self.CRC == other.CRC and \
+               self.comment == other.comment and \
+               self.compress_size == other.compress_size and \
+               self.compress_type == other.compress_type and \
+               self.create_system == other.create_system and \
+               self.create_version == other.create_version and \
+               self.date_time == other.date_time and \
+               self.external_attr == other.external_attr and \
+               self.extra == other.extra and \
+               self.extract_version == other.extract_version and \
+               self.file_size == other.file_size and \
+               self.filename == other.filename and \
+               self.flag_bits == other.flag_bits and \
+               self.header_offset == other.header_offset and \
+               self.internal_attr == other.internal_attr and \
+               self.reserved == other.reserved and \
+               self.volume == other.volume
+
     def FileHeader(self, zip64=None):
         """Return the per-file header as a bytes object.
 
@@ -859,16 +878,19 @@ class ZipExtFile(io.BufferedIOBase):
     MAX_SEEK_READ = 1 << 24
 
     def __init__(self, fileobj, mode, zipinfo, pwd=None,
-                 close_fileobj=False):
+                 close_fileobj=False, decompress=True):
         self._fileobj = fileobj
         self._pwd = pwd
         self._close_fileobj = close_fileobj
 
-        self._compress_type = zipinfo.compress_type
+        # if we aren't decompressing the data
+        # we pretend that the data wasn't compressed
+        # so that we don't process the data
+        self._compress_type = zipinfo.compress_type if decompress else ZIP_STORED
         self._compress_left = zipinfo.compress_size
         self._left = zipinfo.file_size
 
-        self._decompressor = _get_decompressor(self._compress_type)
+        self._decompressor = _get_decompressor(self._compress_type) if decompress else None
 
         self._eof = False
         self._readbuffer = b''
@@ -879,7 +901,7 @@ class ZipExtFile(io.BufferedIOBase):
         self.mode = mode
         self.name = zipinfo.filename
 
-        if hasattr(zipinfo, 'CRC'):
+        if hasattr(zipinfo, 'CRC') and decompress:
             self._expected_crc = zipinfo.CRC
             self._running_crc = crc32(b'')
         else:
@@ -1582,9 +1604,9 @@ class ZipFile:
         self._comment = comment
         self._didModify = True
 
-    def read(self, name, pwd=None):
+    def read(self, name, pwd=None, precompressed=False):
         """Return file bytes for name."""
-        with self.open(name, "r", pwd) as fp:
+        with self.open(name, "r", pwd, precompressed=precompressed) as fp:
             return fp.read()
 
     def open(self, name, mode="r", pwd=None, *, force_zip64=False,
@@ -1616,8 +1638,7 @@ class ZipFile:
             raise ValueError(
                 "Attempt to use ZIP archive that was already closed")
 
-        if precompressed:
-            assert mode == "w", "precompressed is only for writing"
+        if precompressed and mode == "w":
             assert isinstance(name, ZipInfo), "precompressed needs ZipInfo"
             assert name.CRC is not None, "precompressed requires ZipInfo.CRC"
 
@@ -1692,7 +1713,7 @@ class ZipFile:
             else:
                 pwd = None
 
-            return ZipExtFile(zef_file, mode, zinfo, pwd, True)
+            return ZipExtFile(zef_file, mode, zinfo, pwd, True, not precompressed)
         except:
             zef_file.close()
             raise
@@ -1854,9 +1875,19 @@ class ZipFile:
                 raise LargeZipFile(requires_zip64 +
                                    " would require ZIP64 extensions")
 
+    def _check_zinfo_meets_precompressed_criteria(self, zinfo):
+        if zinfo is None:
+            raise ValueError("zinfo cannot be None when precompressed=True")
+        if zinfo.CRC is None:
+            raise ValueError("zinfo.CRC cannot be None"
+                             "when precompressed=True")
+        if zinfo.filename is None:
+            raise ValueError("zinfo.filename cannot be None"
+                                "when precompressed=True")
+
     def write(self, filename, arcname=None,
               compress_type=None, compresslevel=None,
-              *, zinfo=None, precompressed=None):
+              *, zinfo=None, precompressed=False):
         """Copy the bytes from a file into the archive as arcname.
 
         *filename* may instead be a file like object open for reading in binary
@@ -1894,8 +1925,17 @@ class ZipFile:
             fileobj = None
 
         if precompressed:
-            assert zinfo is not None, "precompressed requires zinfo"
-            assert zinfo.CRC is not None
+            if fileobj is None:
+                raise ValueError("must provide a file-like object"
+                                 "when precompressed=True")
+            self._check_zinfo_meets_precompressed_criteria(zinfo)
+            if compress_type is not None:
+                raise ValueError("compress_type must be None"
+                                 "when precompressed=True")
+            if compresslevel is not None:
+                raise ValueError("compresslevel must be None"
+                                 "when precompressed=True")
+
         elif zinfo:
             if not fileobj:
                 # We do not use os.stat() or os.fstat() when a fileobj was
@@ -1913,20 +1953,15 @@ class ZipFile:
             zinfo.compress_size = 0
             zinfo.CRC = 0
             self.mkdir(zinfo)
-        else:
-            if compress_type is not None:
-                zinfo.compress_type = compress_type
-            else:
-                zinfo.compress_type = self.compression
+            return
 
-            if compresslevel is not None:
-                zinfo._compresslevel = compresslevel
-            else:
-                zinfo._compresslevel = self.compresslevel
+        if not precompressed:
+            zinfo.compress_type = compress_type if compress_type is not None else self.compression
+            zinfo._compresslevel = compresslevel if compresslevel is not None else self.compresslevel
 
-            with (fileobj if fileobj else open(filename, "rb")) as src, \
-                    self.open(zinfo, "w", precompressed=precompressed) as dest:
-                shutil.copyfileobj(src, dest)
+        with (fileobj if fileobj else open(filename, "rb")) as src, \
+                self.open(zinfo, "w", precompressed=precompressed) as dest:
+            shutil.copyfileobj(src, dest)
 
     def writestr(self, zinfo_or_arcname, data,
                  compress_type=None, compresslevel=None, *,
@@ -1973,6 +2008,15 @@ class ZipFile:
             raise ValueError(
                 "Can't write to ZIP archive while an open writing handle exists."
             )
+
+        if precompressed:
+            self._check_zinfo_meets_precompressed_criteria(zinfo)
+            if compress_type is not None:
+                raise ValueError("compress_type must be None"
+                                 "when precompressed=True")
+            if compresslevel is not None:
+                raise ValueError("compresslevel must be None"
+                                 "when precompressed=True")
 
         if compress_type is not None:
             zinfo.compress_type = compress_type
