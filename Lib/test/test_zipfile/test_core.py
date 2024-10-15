@@ -13,7 +13,7 @@ import time
 import unittest
 import unittest.mock as mock
 import zipfile
-
+import filecmp
 
 from tempfile import TemporaryFile
 from random import randint, random, randbytes
@@ -2337,12 +2337,11 @@ class LzmaBadCrcTests(AbstractBadCrcTests, unittest.TestCase):
         b'\x00>\x00\x00\x00\x00\x00')
 
 
-class DecryptionTests(unittest.TestCase):
-    """Check that ZIP decryption works. Since the library does not
-    support encryption at the moment, we use a pre-generated encrypted
-    ZIP file."""
+class EncryptedFiles:
+    """ Since the library does not support encryption at the moment,
+    we use pre-generated encrypted ZIP files."""
 
-    data = (
+    encyrpted_zip1 = (
         b'PK\x03\x04\x14\x00\x01\x00\x00\x00n\x92i.#y\xef?&\x00\x00\x00\x1a\x00'
         b'\x00\x00\x08\x00\x00\x00test.txt\xfa\x10\xa0gly|\xfa-\xc5\xc0=\xf9y'
         b'\x18\xe0\xa8r\xb3Z}Lg\xbc\xae\xf9|\x9b\x19\xe4\x8b\xba\xbb)\x8c\xb0\xdbl'
@@ -2350,7 +2349,10 @@ class DecryptionTests(unittest.TestCase):
         b'\x1a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x01\x00 \x00\xb6\x81'
         b'\x00\x00\x00\x00test.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00'
         b'\x00\x00L\x00\x00\x00\x00\x00' )
-    data2 = (
+
+    zip1_filename = "test.txt"
+
+    encyrpted_zip2 = (
         b'PK\x03\x04\x14\x00\t\x00\x08\x00\xcf}38xu\xaa\xb2\x14\x00\x00\x00\x00\x02'
         b'\x00\x00\x04\x00\x15\x00zeroUT\t\x00\x03\xd6\x8b\x92G\xda\x8b\x92GUx\x04'
         b'\x00\xe8\x03\xe8\x03\xc7<M\xb5a\xceX\xa3Y&\x8b{oE\xd7\x9d\x8c\x98\x02\xc0'
@@ -2360,15 +2362,19 @@ class DecryptionTests(unittest.TestCase):
         b'roUT\x05\x00\x03\xd6\x8b\x92GUx\x00\x00PK\x05\x06\x00\x00\x00\x00\x01'
         b'\x00\x01\x00?\x00\x00\x00[\x00\x00\x00\x00\x00' )
 
+
+class DecryptionTests(EncryptedFiles, unittest.TestCase):
+    """Check that ZIP decryption works."""
+
     plain = b'zipfile.py encryption test'
     plain2 = b'\x00'*512
 
     def setUp(self):
         with open(TESTFN, "wb") as fp:
-            fp.write(self.data)
+            fp.write(self.encyrpted_zip1)
         self.zip = zipfile.ZipFile(TESTFN, "r")
         with open(TESTFN2, "wb") as fp:
-            fp.write(self.data2)
+            fp.write(self.encyrpted_zip2)
         self.zip2 = zipfile.ZipFile(TESTFN2, "r")
 
     def tearDown(self):
@@ -2451,6 +2457,216 @@ class DecryptionTests(unittest.TestCase):
             # Read the file completely to definitely call any eof integrity
             # checks (crc) and make sure they still pass.
             fp.read()
+
+
+class AbstractCopyFileTests(EncryptedFiles):
+    @classmethod
+    def write_small_file(cls, destination):
+        destination.writestr(cls.small_content_filename,
+                             cls.small_source_content,
+                             compress_type=cls.compression)
+
+    @classmethod
+    def write_large_file(cls, destination):
+        destination.writestr(cls.large_content_filename,
+                             cls.large_source_content,
+                             compress_type=cls.compression)
+
+    @classmethod
+    def write_preexisting_file(cls, destination):
+        destination.writestr(cls.preexisting_content_filename,
+                             cls.preexisting_content,
+                             compress_type=cls.compression)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.zipfile_with_small_content = TESTFN2
+        cls.zipfile_with_large_content = TESTFN + "3"
+        cls.zipfile_with_small_and_large_content = TESTFN + "4"
+        cls.zipfile_with_preexisting_and_small_and_large_content = TESTFN + "5"
+        cls.zipfile_for_exception_tests = TESTFN + "6"
+        cls.zipfile_with_only_an_emtpy_dir = TESTFN + "7"
+        cls.zipfile_encrypted = TESTFN + "8"
+
+        cls.small_source_content = "a"
+        cls.large_source_content = "b" * 400
+        cls.preexisting_content = "c" * 40
+
+        cls.small_content_filename = "small.txt"
+        cls.large_content_filename = "large.txt"
+        cls.preexisting_content_filename = "preexisting.txt"
+        cls.directory_name = "directory/"
+        cls.directory_mode = 123 # use value other than default to ensure value is copied
+
+        # create zipfiles to compare against
+        with zipfile.ZipFile(cls.zipfile_with_small_content,
+                             "w") as destination:
+            cls.write_small_file(destination)
+
+        with zipfile.ZipFile(cls.zipfile_with_large_content,
+                             "w") as destination:
+            cls.write_large_file(destination)
+
+        with zipfile.ZipFile(cls.zipfile_with_small_and_large_content,
+                             "w") as destination:
+            cls.write_small_file(destination)
+            cls.write_large_file(destination)
+
+        with zipfile.ZipFile(
+                cls.zipfile_with_preexisting_and_small_and_large_content,
+                "w") as destination:
+            cls.write_preexisting_file(destination)
+            cls.write_small_file(destination)
+            cls.write_large_file(destination)
+
+        with zipfile.ZipFile(cls.zipfile_for_exception_tests,
+                             "w") as destination:
+            cls.write_small_file(destination)
+
+        with zipfile.ZipFile(cls.zipfile_with_only_an_emtpy_dir,
+                             "w") as destination:
+            destination.mkdir(cls.directory_name, mode=123)
+
+        with open(cls.zipfile_encrypted, "wb") as destination:
+            destination.write(cls.encyrpted_zip1)
+
+    def tearDown(cls):
+        if os.path.exists(TESTFN):
+            unlink(TESTFN)
+
+    @classmethod
+    def tearDownClass(cls):
+        unlink(cls.zipfile_with_small_content)
+        unlink(cls.zipfile_with_large_content)
+        unlink(cls.zipfile_with_small_and_large_content)
+        unlink(cls.zipfile_with_preexisting_and_small_and_large_content)
+        unlink(cls.zipfile_for_exception_tests)
+        unlink(cls.zipfile_with_only_an_emtpy_dir)
+        unlink(cls.zipfile_encrypted)        
+
+    def test_copy_file_copy_one_small_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_file(self.zipfile_with_small_content, self.small_content_filename)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_content, shallow=False))
+
+    def test_copy_file_copy_one_large_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_file(self.zipfile_with_large_content, self.large_content_filename)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_large_content, shallow=False))
+
+    def test_copy_file_copy_one_file_to_nonempty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            self.write_small_file(destination)
+            destination.copy_file(self.zipfile_with_large_content, self.large_content_filename)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_and_large_content, shallow=False))
+
+    def test_copy_file_copy_directory(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_file(self.zipfile_with_only_an_emtpy_dir, self.directory_name)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_only_an_emtpy_dir, shallow=False))
+
+    def test_copy_file_copy_encrypted_file(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_file(self.zipfile_encrypted, self.zip1_filename)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_encrypted, shallow=False))
+
+    def test_copy_files_copy_one_small_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_files(self.zipfile_with_small_content, [self.small_content_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_content, shallow=False))
+
+    def test_copy_files_copy_one_large_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_files(self.zipfile_with_large_content, [self.large_content_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_large_content, shallow=False))
+
+    def test_copy_files_copy_one_file_to_nonempty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            self.write_small_file(destination)
+            destination.copy_files(self.zipfile_with_large_content, [self.large_content_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_and_large_content, shallow=False))
+
+    def test_copy_files_copy_two_files_to_empty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_files(self.zipfile_with_small_and_large_content, [self.small_content_filename, self.large_content_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_and_large_content, shallow=False))
+
+    def test_copy_files_copy_two_files_to_nonempty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            self.write_preexisting_file(destination)
+            destination.copy_files(self.zipfile_with_small_and_large_content, [self.small_content_filename, self.large_content_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_preexisting_and_small_and_large_content, shallow=False))
+
+    def test_copy_files_copy_encrypted_file(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_files(self.zipfile_encrypted, [self.zip1_filename])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_encrypted, shallow=False))
+
+    def test_copy_all_files_copy_one_small_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_all_files(self.zipfile_with_small_content)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_content, shallow=False))
+
+    def test_copy_files_copy_directory(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_files(self.zipfile_with_only_an_emtpy_dir, [self.directory_name])
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_only_an_emtpy_dir, shallow=False))
+
+    def test_copy_all_files_copy_one_large_file_to_new_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_all_files(self.zipfile_with_large_content)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_large_content, shallow=False))
+
+    def test_copy_all_files_copy_two_files_to_empty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_all_files(self.zipfile_with_small_and_large_content)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_small_and_large_content, shallow=False))
+
+    def test_copy_all_files_copy_two_files_to_nonempty_ZipFile(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            self.write_preexisting_file(destination)
+            destination.copy_all_files(self.zipfile_with_small_and_large_content)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_preexisting_and_small_and_large_content, shallow=False))
+
+    def test_copy_all_files_copy_directory(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_all_files(self.zipfile_with_only_an_emtpy_dir)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_with_only_an_emtpy_dir, shallow=False))
+
+    def test_copy_all_files_copy_encrypted_file(self):
+        with zipfile.ZipFile(TESTFN, 'w') as destination:
+            destination.copy_all_files(self.zipfile_encrypted)
+        self.assertTrue(filecmp.cmp(TESTFN, self.zipfile_encrypted, shallow=False))
+
+class StoredCopyFileTests(AbstractCopyFileTests, unittest.TestCase):
+    compression = zipfile.ZIP_STORED
+
+    def test_copy_file_issues_exception_when_zipfile_open_for_reading(self):
+        with zipfile.ZipFile(self.zipfile_for_exception_tests, 'r') as destination:
+            with self.assertRaises(ValueError):
+                destination.copy_file(self.zipfile_with_small_content, self.small_content_filename)
+
+    def test_copy_files_issues_exception_when_zipfile_open_for_reading(self):
+        with zipfile.ZipFile(self.zipfile_for_exception_tests, 'r') as destination:
+            with self.assertRaises(ValueError):
+                destination.copy_files(self.zipfile_with_small_content, [self.small_content_filename])
+
+    def test_copy_all_files_issues_exception_when_zipfile_open_for_reading(self):
+        with zipfile.ZipFile(self.zipfile_for_exception_tests, 'r') as destination:
+            with self.assertRaises(ValueError):
+                destination.copy_all_files(self.zipfile_with_small_content)
+
+@requires_zlib()
+class DeflateCopyFileTests(AbstractCopyFileTests, unittest.TestCase):
+    compression = zipfile.ZIP_DEFLATED
+
+@requires_bz2()
+class Bzip2CopyFileTests(AbstractCopyFileTests, unittest.TestCase):
+    compression = zipfile.ZIP_BZIP2
+
+@requires_lzma()
+class LzmaCopyFileTests(AbstractCopyFileTests, unittest.TestCase):
+    compression = zipfile.ZIP_LZMA
 
 
 class AbstractTestsWithRandomBinaryFiles:

@@ -840,16 +840,28 @@ class ZipExtFile(io.BufferedIOBase):
     MAX_SEEK_READ = 1 << 24
 
     def __init__(self, fileobj, mode, zipinfo, pwd=None,
-                 close_fileobj=False):
+                 close_fileobj=False, decompress=True):
         self._fileobj = fileobj
         self._pwd = pwd
         self._close_fileobj = close_fileobj
 
-        self._compress_type = zipinfo.compress_type
+        if decompress:
+            self._compress_type = zipinfo.compress_type
+        else:
+            # if we aren't decompressing the data,
+            # we pretend that the data wasn't compressed
+            # so that we don't process the data
+            self._compress_type = ZIP_STORED
         self._compress_left = zipinfo.compress_size
-        self._left = zipinfo.file_size
+        if decompress:
+            self._left = zipinfo.file_size
+        else:
+            self._left = zipinfo.compress_size
 
-        self._decompressor = _get_decompressor(self._compress_type)
+        if decompress:
+            self._decompressor = _get_decompressor(self._compress_type)
+        else:
+            self._decompressor = None
 
         self._eof = False
         self._readbuffer = b''
@@ -860,7 +872,7 @@ class ZipExtFile(io.BufferedIOBase):
         self.mode = mode
         self.name = zipinfo.filename
 
-        if hasattr(zipinfo, 'CRC'):
+        if hasattr(zipinfo, 'CRC') and decompress:
             self._expected_crc = zipinfo.CRC
             self._running_crc = crc32(b'')
         else:
@@ -1169,15 +1181,24 @@ class ZipExtFile(io.BufferedIOBase):
 
 
 class _ZipWriteFile(io.BufferedIOBase):
-    def __init__(self, zf, zinfo, zip64):
+    def __init__(self, zf, zinfo, zip64, *, precompressed=False):
         self._zinfo = zinfo
         self._zip64 = zip64
         self._zipfile = zf
-        self._compressor = _get_compressor(zinfo.compress_type,
-                                           zinfo._compresslevel)
-        self._file_size = 0
+        if precompressed:
+            self._compute_crc = False  # Precomputed in zinfo.
+            self._crc = zinfo.CRC
+            self._compute_file_size = False  # Precomputed in zinfo.
+            self._file_size = zinfo.file_size
+            self._compressor = None
+        else:
+            self._compute_crc = True
+            self._crc = 0
+            self._compute_file_size = True
+            self._file_size = 0
+            self._compressor = _get_compressor(zinfo.compress_type,
+                                               zinfo._compresslevel)
         self._compress_size = 0
-        self._crc = 0
 
     @property
     def _fileobj(self):
@@ -1196,12 +1217,14 @@ class _ZipWriteFile(io.BufferedIOBase):
         else:
             data = memoryview(data)
             nbytes = data.nbytes
-        self._file_size += nbytes
+        if self._compute_file_size:
+            self._file_size += nbytes
 
-        self._crc = crc32(data, self._crc)
+        if self._compute_crc:
+            self._crc = crc32(data, self._crc)
         if self._compressor:
             data = self._compressor.compress(data)
-            self._compress_size += len(data)
+        self._compress_size += len(data)
         self._fileobj.write(data)
         return nbytes
 
@@ -1215,11 +1238,11 @@ class _ZipWriteFile(io.BufferedIOBase):
                 buf = self._compressor.flush()
                 self._compress_size += len(buf)
                 self._fileobj.write(buf)
-                self._zinfo.compress_size = self._compress_size
-            else:
-                self._zinfo.compress_size = self._file_size
-            self._zinfo.CRC = self._crc
-            self._zinfo.file_size = self._file_size
+            self._zinfo.compress_size = self._compress_size
+            if self._compute_crc:
+                self._zinfo.CRC = self._crc
+            if self._compute_file_size:
+                self._zinfo.file_size = self._file_size
 
             if not self._zip64:
                 if self._file_size > ZIP64_LIMIT:
@@ -1549,22 +1572,7 @@ class ZipFile:
         with self.open(name, "r", pwd) as fp:
             return fp.read()
 
-    def open(self, name, mode="r", pwd=None, *, force_zip64=False):
-        """Return file-like object for 'name'.
-
-        name is a string for the file name within the ZIP file, or a ZipInfo
-        object.
-
-        mode should be 'r' to read a file already in the ZIP file, or 'w' to
-        write to a file newly added to the archive.
-
-        pwd is the password to decrypt files (only used for reading).
-
-        When writing, if the file size is not known in advance but may exceed
-        2 GiB, pass force_zip64 to use the ZIP64 format, which can handle large
-        files.  If the size is known in advance, it is best to pass a ZipInfo
-        instance for name, with zinfo.file_size set.
-        """
+    def _open(self, name, mode="r", pwd=None, *, force_zip64=False, decompress=True, precompressed=False):
         if mode not in {"r", "w"}:
             raise ValueError('open() requires mode "r" or "w"')
         if pwd and (mode == "w"):
@@ -1586,6 +1594,8 @@ class ZipFile:
             zinfo = self.getinfo(name)
 
         if mode == 'w':
+            if precompressed:
+                return self._open_to_write_precompressed(zinfo, force_zip64=force_zip64)
             return self._open_to_write(zinfo, force_zip64=force_zip64)
 
         if self._writing:
@@ -1631,7 +1641,7 @@ class ZipFile:
 
             # check for encrypted flag & handle password
             is_encrypted = zinfo.flag_bits & _MASK_ENCRYPTED
-            if is_encrypted:
+            if is_encrypted and decompress:
                 if not pwd:
                     pwd = self.pwd
                 if pwd and not isinstance(pwd, bytes):
@@ -1642,12 +1652,30 @@ class ZipFile:
             else:
                 pwd = None
 
-            return ZipExtFile(zef_file, mode, zinfo, pwd, True)
+            return ZipExtFile(zef_file, mode, zinfo, pwd, True, decompress)
         except:
             zef_file.close()
             raise
 
-    def _open_to_write(self, zinfo, force_zip64=False):
+    def open(self, name, mode="r", pwd=None, *, force_zip64=False):
+        """Return file-like object for 'name'.
+
+        name is a string for the file name within the ZIP file, or a ZipInfo
+        object.
+
+        mode should be 'r' to read a file already in the ZIP file, or 'w' to
+        write to a file newly added to the archive.
+
+        pwd is the password to decrypt files (only used for reading).
+
+        When writing, if the file size is not known in advance but may exceed
+        2 GiB, pass force_zip64 to use the ZIP64 format, which can handle large
+        files.  If the size is known in advance, it is best to pass a ZipInfo
+        instance for name, with zinfo.file_size set.
+        """
+        return self._open(name, mode, pwd, force_zip64=force_zip64)
+
+    def _check_can_open_to_write(self, force_zip64):
         if force_zip64 and not self._allowZip64:
             raise ValueError(
                 "force_zip64 is True, but allowZip64 was False when opening "
@@ -1657,6 +1685,31 @@ class ZipFile:
             raise ValueError("Can't write to the ZIP file while there is "
                              "another write handle open on it. "
                              "Close the first handle before opening another.")
+
+    def _set_to_write(self, zinfo, is_zip64):
+        if self._seekable:
+            self.fp.seek(self.start_dir)
+        zinfo.header_offset = self.fp.tell()
+
+        self._writecheck(zinfo)
+        self._didModify = True
+
+        self.fp.write(zinfo.FileHeader(is_zip64))
+
+        self._writing = True
+
+    def _open_to_write_precompressed(self, zinfo, force_zip64=False):
+        self._check_can_open_to_write(force_zip64)
+
+        zip64 = force_zip64 or (zinfo.compress_size > ZIP64_LIMIT)
+        if not self._allowZip64 and zip64:
+            raise LargeZipFile("Filesize would require ZIP64 extensions")
+
+        self._set_to_write(zinfo, zip64)
+        return _ZipWriteFile(self, zinfo, zip64, precompressed=True)
+
+    def _open_to_write(self, zinfo, force_zip64=False):
+        self._check_can_open_to_write(force_zip64)
 
         # Size and CRC are overwritten with correct data after processing the file
         zinfo.compress_size = 0
@@ -1677,16 +1730,7 @@ class ZipFile:
         if not self._allowZip64 and zip64:
             raise LargeZipFile("Filesize would require ZIP64 extensions")
 
-        if self._seekable:
-            self.fp.seek(self.start_dir)
-        zinfo.header_offset = self.fp.tell()
-
-        self._writecheck(zinfo)
-        self._didModify = True
-
-        self.fp.write(zinfo.FileHeader(zip64))
-
-        self._writing = True
+        self._set_to_write(zinfo, zip64)
         return _ZipWriteFile(self, zinfo, zip64)
 
     def extract(self, member, path=None, pwd=None):
@@ -1779,13 +1823,18 @@ class ZipFile:
 
         return targetpath
 
+    def _check_in_w_x_or_a_mode(self, caller_name):
+        if self.mode not in ('w', 'x', 'a'):
+            raise ValueError(
+                f"{caller_name}() requires mode 'w', 'x', or 'a', but "
+                f"mode is '{self.mode}'")
+
     def _writecheck(self, zinfo):
         """Check for errors before writing a file to the archive."""
         if zinfo.filename in self.NameToInfo:
             import warnings
             warnings.warn('Duplicate name: %r' % zinfo.filename, stacklevel=3)
-        if self.mode not in ('w', 'x', 'a'):
-            raise ValueError("write() requires mode 'w', 'x', or 'a'")
+        self._check_in_w_x_or_a_mode("write")
         if not self.fp:
             raise ValueError(
                 "Attempt to write ZIP archive that was already closed")
@@ -1802,10 +1851,7 @@ class ZipFile:
                 raise LargeZipFile(requires_zip64 +
                                    " would require ZIP64 extensions")
 
-    def write(self, filename, arcname=None,
-              compress_type=None, compresslevel=None):
-        """Put the bytes from filename into the archive under the name
-        arcname."""
+    def _check_available_for_writing(self):
         if not self.fp:
             raise ValueError(
                 "Attempt to write to ZIP archive that was already closed")
@@ -1813,6 +1859,22 @@ class ZipFile:
             raise ValueError(
                 "Can't write to ZIP archive while an open writing handle exists"
             )
+
+    def _write_precompressed(self, zinfo, file_contents):
+        self._check_available_for_writing()
+
+        if zinfo.is_dir():
+            self.mkdir(zinfo)
+            return
+
+        with self._open(zinfo, 'w', precompressed=True) as destination:
+            shutil.copyfileobj(file_contents, destination, 1024*8)
+
+    def write(self, filename, arcname=None,
+              compress_type=None, compresslevel=None):
+        """Put the bytes from filename into the archive under the name
+        arcname."""
+        self._check_available_for_writing()
 
         zinfo = ZipInfo.from_file(filename, arcname,
                                   strict_timestamps=self._strict_timestamps)
@@ -1910,6 +1972,30 @@ class ZipFile:
             self.NameToInfo[zinfo.filename] = zinfo
             self.fp.write(zinfo.FileHeader(False))
             self.start_dir = self.fp.tell()
+
+    def _copy_file(self, source_zipfile, source_zinfo):
+        with source_zipfile._open(source_zinfo, decompress=False) as source_file_contents:
+            self._write_precompressed(source_zinfo, source_file_contents)
+
+    def copy_file(self, source_zipfile, file):
+        self._check_in_w_x_or_a_mode("copy_file")
+        with ZipFile(source_zipfile, 'r') as source:
+            source_zinfo = source.getinfo(file)
+            self._copy_file(source, source_zinfo)
+
+    def copy_files(self, source_zipfile, files):
+        self._check_in_w_x_or_a_mode("copy_files")
+        with ZipFile(source_zipfile, 'r') as source:
+            for file in files:
+                source_zinfo = source.getinfo(file)
+                self._copy_file(source, source_zinfo)
+
+    def copy_all_files(self, source_zipfile):
+        self._check_in_w_x_or_a_mode("copy_all_files")
+        with ZipFile(source_zipfile, 'r') as source:
+            source_zinfos = source.infolist()
+            for source_zinfo in source_zinfos:
+                self._copy_file(source, source_zinfo)
 
     def __del__(self):
         """Call the "close()" method in case the user forgot."""
